@@ -1,0 +1,31 @@
+# --- Kun dette trengs for GitHub Pages ---
+# index.html, styles.css, app.js
+# qualification-data.js, data.js, form-data.js
+
+# Bygg-/vedlikeholdsskript (genererer *.js lokalt)
+scripts/
+
+# Kildefiler og referansedokumenter (ikke lastet av siden)
+*.txt
+*.pdf
+
+# Node (hvis du legger til npm senere)
+node_modules/
+
+# Hemmeligheter og lokale miljøfiler
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Cursor (lokale prosjektinnstillinger)
+.cursor/
