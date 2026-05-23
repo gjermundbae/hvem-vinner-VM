@@ -226,6 +226,23 @@
 
   let simState = loadState();
 
+  // Seed default ordering (data.js order) for any group not yet ranked, so
+  // the user gets an "out of the box" lineup they can refine instead of an
+  // empty form.
+  (function seedDefaultOrder() {
+    let changed = false;
+    for (const g of ALL_GROUPS) {
+      const cur = simState.groupOrder[g];
+      if (!Array.isArray(cur) || cur.length !== teamsByGroup[g].length) {
+        simState.groupOrder[g] = teamsByGroup[g].map((t) => t.code);
+        changed = true;
+      }
+    }
+    if (changed) {
+      try { localStorage.setItem(STATE_KEY, JSON.stringify(simState)); } catch (_) {}
+    }
+  })();
+
   function persist() {
     try {
       localStorage.setItem(STATE_KEY, JSON.stringify(simState));
@@ -234,6 +251,9 @@
 
   function resetState() {
     simState = defaultState();
+    for (const g of ALL_GROUPS) {
+      simState.groupOrder[g] = teamsByGroup[g].map((t) => t.code);
+    }
     persist();
     route();
   }
@@ -271,6 +291,21 @@
 
   function allThirdStatsComplete() {
     return ALL_GROUPS.every(thirdStatComplete);
+  }
+
+  // Default any missing pts/gd/gf to 0 for ranked groups so the bracket can
+  // be opened even if the user skipped the cutline form.
+  function fillMissingThirdStats() {
+    for (const g of ALL_GROUPS) {
+      if (!isGroupRanked(g)) continue;
+      const cur = simState.thirdStats[g] || {};
+      simState.thirdStats[g] = {
+        pts: Number.isFinite(cur.pts) ? cur.pts : 0,
+        gd: Number.isFinite(cur.gd) ? cur.gd : 0,
+        gf: Number.isFinite(cur.gf) ? cur.gf : 0,
+      };
+    }
+    persist();
   }
 
   // Top eight third-placed teams, by pts -> gd -> gf -> group letter.
@@ -389,26 +424,30 @@
   }
 
   function renderSimToolbar() {
-    const ready = allGroupsRanked() && allThirdStatsComplete();
+    const ranked = allGroupsRanked();
+    const ready = ranked && allThirdStatsComplete();
     const groupsDone = ALL_GROUPS.filter(isGroupRanked).length;
     const statsDone = ALL_GROUPS.filter(thirdStatComplete).length;
 
     const status = ready
-      ? "Klar for sluttspill — bracketen er åpen."
-      : !allGroupsRanked()
+      ? "Klar for sluttspill?"
+      : !ranked
         ? `Ranger lagene i hver gruppe (${groupsDone}/12 ferdig).`
-        : `Fyll inn poeng og målforskjell for tredjeplassene (${statsDone}/12 ferdig).`;
+        : `Fyll inn poeng og målforskjell for tredjeplassene (${statsDone}/12 — manglende felt blir 0).`;
+
+    const goToBracket = () => {
+      if (ranked && !ready) fillMissingThirdStats();
+    };
 
     const actions = [
       h(
         "a",
         {
-          class: ready ? "btn btn-primary" : "btn btn-disabled",
-          href: ready ? "#/bracket" : "#",
-          "aria-disabled": ready ? "false" : "true",
-          onclick: (e) => { if (!ready) e.preventDefault(); },
+          class: ranked ? "btn btn-primary" : "btn",
+          href: "#/bracket",
+          onclick: goToBracket,
         },
-        "Gå til bracket →"
+        ranked ? "Gå til bracket →" : "Inspiser bracket →"
       ),
       h(
         "button",
@@ -451,8 +490,7 @@
 
     const children = [
       h("div", { class: "group-header" }, [
-        h("h2", { class: "group-title", "data-letter": g }, `Gruppe ${g}`),
-        h("span", { class: "group-hint" }, ranked ? "Rangert" : "Dra for å rangere"),
+        h("h2", { class: "group-title", "data-letter": g, "aria-label": `Gruppe ${g}` }),
       ]),
       list,
     ];
@@ -488,20 +526,21 @@
         "aria-label": `Plass ${idx + 1}: ${team.name}`,
       },
       [
-        h("span", { class: `rank-badge rank-${idx + 1}` }, String(idx + 1)),
-        h("button", {
-          class: "rank-handle",
-          type: "button",
-          "aria-label": "Dra for å endre plassering",
-          title: "Dra",
-          html: "⋮⋮",
-        }),
+        h(
+          "span",
+          {
+            class: `rank-badge rank-${idx + 1}`,
+            "aria-label": `Plass ${idx + 1} — dra for å endre`,
+            title: "Dra for å endre plassering",
+          },
+          String(idx + 1)
+        ),
         h("div", { class: "rank-card-main" }, [
           h("div", { class: "team-card-top" }, [
             h("span", { class: "team-flag" }, team.flag),
             h("div", {}, [
               h("div", { class: "team-name" }, team.name),
-              h("div", { class: "team-meta" }, `Trener: ${team.coach}`),
+              h("div", { class: "team-meta" }, team.coach),
             ]),
           ]),
           h("div", { class: "team-card-bottom" }, [
@@ -537,7 +576,7 @@
       simState.groupOrder[g] = teams;
       pruneInvalidWinners();
       persist();
-      route();
+      updateGroupInPlace(g);
       const next = document.querySelector(`.rank-card[data-group="${g}"][data-code="${team.code}"]`);
       if (next) next.focus();
     });
@@ -588,8 +627,47 @@
       simState.groupOrder[g] = order;
       pruneInvalidWinners();
       persist();
-      route();
+      updateGroupInPlace(g);
     });
+  }
+
+  // Reorder rank-cards in a group's DOM list and refresh dependent UI
+  // (rank badges, third-place panel, sim toolbar) without triggering a full
+  // re-render — keeps scroll position and avoids flicker.
+  function updateGroupInPlace(g) {
+    const list = document.querySelector(`.rank-list[data-group="${g}"]`);
+    if (!list) return;
+    const order = orderedGroup(g);
+
+    for (const team of order) {
+      const card = list.querySelector(`.rank-card[data-code="${team.code}"]`);
+      if (card) list.appendChild(card);
+    }
+
+    Array.from(list.querySelectorAll(".rank-card")).forEach((card, idx) => {
+      const team = order[idx];
+      const badge = card.querySelector(".rank-badge");
+      if (badge) {
+        badge.textContent = String(idx + 1);
+        badge.className = `rank-badge rank-${idx + 1}`;
+      }
+      card.setAttribute("aria-label", `Plass ${idx + 1}: ${team.name}`);
+    });
+
+    const groupSection = list.closest(".group");
+    if (groupSection) {
+      const oldStats = groupSection.querySelector(".third-stats");
+      if (isGroupRanked(g)) {
+        const newStats = renderThirdStats(g, order[2]);
+        if (oldStats) oldStats.replaceWith(newStats);
+        else groupSection.appendChild(newStats);
+      } else if (oldStats) {
+        oldStats.remove();
+      }
+    }
+
+    const tb = document.querySelector(".sim-toolbar");
+    if (tb) tb.replaceWith(renderSimToolbar());
   }
 
   function renderThirdStats(g, team) {
@@ -623,7 +701,6 @@
       h("div", { class: "third-stats-head" }, [
         h("span", { class: "team-flag", style: "font-size:18px" }, team.flag),
         h("strong", {}, team.name),
-        h("span", { class: "third-stats-hint" }, "Tredjeplass — fyll inn for cutline:"),
       ]),
       h("div", { class: "third-stats-fields" }, [
         input("Poeng", "pts", 0, 9),
@@ -651,7 +728,7 @@
             if (confirm("Nullstille alle vinnervalg i bracketen?")) {
               simState.matchWinners = {};
               persist();
-              route();
+              updateBracketInPlace();
             }
           },
         }, "Nullstill bracket"),
@@ -732,7 +809,10 @@
       );
     };
 
-    return h("article", { class: `bracket-match round-${fx.round}` }, [
+    return h("article", {
+      class: `bracket-match round-${fx.round}`,
+      "data-match-id": String(fx.id),
+    }, [
       h("header", { class: "bracket-match-meta" }, [
         h("span", { class: "bracket-match-id" }, `#${fx.id}`),
         h("span", { class: "bracket-match-date" }, formatDate(fx.date)),
@@ -751,7 +831,63 @@
     }
     pruneInvalidWinners();
     persist();
-    route();
+    if ((location.hash || "#/") === "#/bracket") {
+      updateBracketInPlace();
+    } else {
+      route();
+    }
+  }
+
+  // Refresh bracket UI after a pick without full route() — keeps scroll position.
+  function updateBracketInPlace() {
+    const page = document.querySelector(".bracket-page");
+    if (!page) {
+      route();
+      return;
+    }
+
+    const champion = simState.matchWinners[104]
+      ? teamByCode[simState.matchWinners[104]]
+      : null;
+    const oldBanner = page.querySelector(".champion-banner");
+    if (champion) {
+      const banner = h("section", { class: "champion-banner" }, [
+        h("span", { class: "champion-trophy" }, "🏆"),
+        h("div", {}, [
+          h("div", { class: "champion-label" }, "Verdensmester 2026"),
+          h("div", { class: "champion-name" }, [
+            h("span", { class: "team-flag", style: "font-size:34px" }, champion.flag),
+            h("span", {}, champion.name),
+          ]),
+        ]),
+      ]);
+      if (oldBanner) oldBanner.replaceWith(banner);
+      else page.insertBefore(banner, page.querySelector(".bracket-grid"));
+    } else if (oldBanner) {
+      oldBanner.remove();
+    }
+
+    const alloc = thirdAllocation();
+    const warnNeeded =
+      allGroupsRanked() && allThirdStatsComplete() && (!alloc || !alloc.mapping);
+    const oldWarn = page.querySelector(".bracket-warning");
+    if (warnNeeded) {
+      const warn = h(
+        "p",
+        { class: "bracket-warning" },
+        "Klarte ikke å slå opp tredjeplass-kombinasjonen."
+      );
+      if (oldWarn) oldWarn.replaceWith(warn);
+      else page.insertBefore(warn, page.querySelector(".bracket-grid"));
+    } else if (oldWarn) {
+      oldWarn.remove();
+    }
+
+    const fixtures = window.BRACKET_FIXTURES || [];
+    for (const fx of fixtures) {
+      const article = page.querySelector(`.bracket-match[data-match-id="${fx.id}"]`);
+      if (article) article.replaceWith(renderBracketMatch(fx));
+    }
   }
 
   function renderTeamDetail(code) {
@@ -769,7 +905,7 @@
         h("span", { class: "team-flag" }, team.flag),
         h("div", {}, [
           h("h1", {}, team.name),
-          h("div", { class: "team-meta" }, `Gruppe ${team.group} · Trener: ${team.coach} · ${team.squad.length} spillere`),
+          h("div", { class: "team-meta" }, `Gruppe ${team.group} · ${team.coach} · ${team.squad.length} spillere`),
         ]),
       ]),
       renderQualification(team),
