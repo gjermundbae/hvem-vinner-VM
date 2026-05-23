@@ -190,67 +190,568 @@
     return h("section", { class: "qualification" }, children);
   }
 
+  // ---------- simulation state ----------
+
+  const STATE_KEY = "vm2026.sim.v1";
+  const STATE_VERSION = 1;
+
+  const teamsByGroup = (() => {
+    const g = {};
+    for (const t of DATA.teams) (g[t.group] = g[t.group] || []).push(t);
+    return g;
+  })();
+  const teamByCode = Object.fromEntries(DATA.teams.map((t) => [t.code, t]));
+  const ALL_GROUPS = Object.keys(teamsByGroup).sort();
+
+  function loadState() {
+    try {
+      const raw = localStorage.getItem(STATE_KEY);
+      if (!raw) return defaultState();
+      const parsed = JSON.parse(raw);
+      if (parsed.version !== STATE_VERSION) return defaultState();
+      return Object.assign(defaultState(), parsed);
+    } catch (_) {
+      return defaultState();
+    }
+  }
+
+  function defaultState() {
+    return {
+      version: STATE_VERSION,
+      groupOrder: {},
+      thirdStats: {},
+      matchWinners: {},
+    };
+  }
+
+  let simState = loadState();
+
+  function persist() {
+    try {
+      localStorage.setItem(STATE_KEY, JSON.stringify(simState));
+    } catch (_) {}
+  }
+
+  function resetState() {
+    simState = defaultState();
+    persist();
+    route();
+  }
+
+  // Returns the user-defined or default order of teams in a group.
+  function orderedGroup(g) {
+    const codes = simState.groupOrder[g];
+    if (Array.isArray(codes) && codes.length === teamsByGroup[g].length) {
+      const lookup = new Map(teamsByGroup[g].map((t) => [t.code, t]));
+      const seen = new Set();
+      const out = [];
+      for (const c of codes) {
+        const t = lookup.get(c);
+        if (t && !seen.has(c)) { out.push(t); seen.add(c); }
+      }
+      for (const t of teamsByGroup[g]) if (!seen.has(t.code)) out.push(t);
+      return out;
+    }
+    return teamsByGroup[g].slice();
+  }
+
+  function isGroupRanked(g) {
+    const codes = simState.groupOrder[g];
+    return Array.isArray(codes) && codes.length === teamsByGroup[g].length;
+  }
+
+  function allGroupsRanked() {
+    return ALL_GROUPS.every(isGroupRanked);
+  }
+
+  function thirdStatComplete(g) {
+    const s = simState.thirdStats[g];
+    return s && Number.isFinite(s.pts) && Number.isFinite(s.gd) && Number.isFinite(s.gf);
+  }
+
+  function allThirdStatsComplete() {
+    return ALL_GROUPS.every(thirdStatComplete);
+  }
+
+  // Top eight third-placed teams, by pts -> gd -> gf -> group letter.
+  function topEightThirds() {
+    if (!allGroupsRanked() || !allThirdStatsComplete()) return null;
+    const ranked = ALL_GROUPS.map((g) => {
+      const code = simState.groupOrder[g][2];
+      const stats = simState.thirdStats[g];
+      return { group: g, code, ...stats };
+    });
+    ranked.sort((a, b) =>
+      b.pts - a.pts ||
+      b.gd - a.gd ||
+      b.gf - a.gf ||
+      a.group.localeCompare(b.group)
+    );
+    return ranked.slice(0, 8);
+  }
+
+  function thirdAllocation() {
+    const top = topEightThirds();
+    if (!top) return null;
+    const key = top.map((r) => r.group).sort().join("");
+    const table = window.THIRD_PLACE_ALLOCATION || {};
+    return { advancing: top, mapping: table[key] || null };
+  }
+
+  // Resolve a slot ref (winner / runnerup / third / matchWinner / matchLoser)
+  // to a team object, or null if not yet decided.
+  function resolveRef(ref) {
+    if (!ref) return null;
+    switch (ref.kind) {
+      case "winner": {
+        if (!isGroupRanked(ref.group)) return null;
+        return teamByCode[simState.groupOrder[ref.group][0]] || null;
+      }
+      case "runnerup": {
+        if (!isGroupRanked(ref.group)) return null;
+        return teamByCode[simState.groupOrder[ref.group][1]] || null;
+      }
+      case "third": {
+        const alloc = thirdAllocation();
+        if (!alloc || !alloc.mapping) return null;
+        const tag = alloc.mapping[ref.slot]; // "3X"
+        if (!tag) return null;
+        const g = tag.slice(1);
+        if (!isGroupRanked(g)) return null;
+        return teamByCode[simState.groupOrder[g][2]] || null;
+      }
+      case "matchWinner": {
+        const code = simState.matchWinners[ref.match];
+        return code ? teamByCode[code] || null : null;
+      }
+      case "matchLoser": {
+        const code = simState.matchWinners[ref.match];
+        if (!code) return null;
+        const fx = (window.BRACKET_FIXTURES || []).find((m) => m.id === ref.match);
+        if (!fx) return null;
+        const home = resolveRef(fx.home);
+        const away = resolveRef(fx.away);
+        if (!home || !away) return null;
+        return code === home.code ? away : home;
+      }
+    }
+    return null;
+  }
+
+  // Human-readable placeholder when a slot is not decided.
+  function refPlaceholder(ref) {
+    switch (ref.kind) {
+      case "winner": return `Vinner gruppe ${ref.group}`;
+      case "runnerup": return `Toer gruppe ${ref.group}`;
+      case "third": {
+        const groups = (window.THIRD_PLACE_SLOTS || {})[ref.slot] || [];
+        return `3-er gruppe ${groups.join("/")}`;
+      }
+      case "matchWinner": return `Vinner kamp ${ref.match}`;
+      case "matchLoser": return `Taper kamp ${ref.match}`;
+    }
+    return "?";
+  }
+
+  // When a match's teams change or a winner is no longer one of the two
+  // teams, drop that winner pick and recursively any pick that depended on it.
+  function pruneInvalidWinners() {
+    const fixtures = window.BRACKET_FIXTURES || [];
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const fx of fixtures) {
+        const winnerCode = simState.matchWinners[fx.id];
+        if (!winnerCode) continue;
+        const home = resolveRef(fx.home);
+        const away = resolveRef(fx.away);
+        const validCodes = [home && home.code, away && away.code].filter(Boolean);
+        if (!validCodes.includes(winnerCode)) {
+          delete simState.matchWinners[fx.id];
+          changed = true;
+        }
+      }
+    }
+  }
+
   // ---------- views ----------
 
   function renderOverview() {
-    const groups = {};
-    for (const t of DATA.teams) {
-      (groups[t.group] = groups[t.group] || []).push(t);
-    }
-    const groupKeys = Object.keys(groups).sort();
-
     const root = h("div", { class: "overview" });
 
-    for (const g of groupKeys) {
-      const teams = groups[g];
-      const groupEl = h("section", { class: "group" }, [
-        h("div", { class: "group-header" }, [
-          h("h2", { class: "group-title", "data-letter": g }, `Gruppe ${g}`),
-          h("span", { class: "group-hint" }, `${teams.length} lag`),
-        ]),
-        h(
-          "div",
-          { class: "team-grid" },
-          teams.map((t) => renderTeamCard(t))
-        ),
-      ]);
-      root.appendChild(groupEl);
+    root.appendChild(renderSimToolbar());
+
+    for (const g of ALL_GROUPS) {
+      root.appendChild(renderGroup(g));
     }
 
     return root;
   }
 
-  function renderTeamCard(team) {
+  function renderSimToolbar() {
+    const ready = allGroupsRanked() && allThirdStatsComplete();
+    const groupsDone = ALL_GROUPS.filter(isGroupRanked).length;
+    const statsDone = ALL_GROUPS.filter(thirdStatComplete).length;
+
+    const status = ready
+      ? "Klar for sluttspill — bracketen er åpen."
+      : !allGroupsRanked()
+        ? `Ranger lagene i hver gruppe (${groupsDone}/12 ferdig).`
+        : `Fyll inn poeng og målforskjell for tredjeplassene (${statsDone}/12 ferdig).`;
+
+    const actions = [
+      h(
+        "a",
+        {
+          class: ready ? "btn btn-primary" : "btn btn-disabled",
+          href: ready ? "#/bracket" : "#",
+          "aria-disabled": ready ? "false" : "true",
+          onclick: (e) => { if (!ready) e.preventDefault(); },
+        },
+        "Gå til bracket →"
+      ),
+      h(
+        "button",
+        {
+          class: "btn btn-ghost",
+          type: "button",
+          onclick: () => {
+            if (confirm("Nullstille all simulering (rangering, poeng, vinnere)?")) {
+              resetState();
+            }
+          },
+        },
+        "Nullstill"
+      ),
+    ];
+
+    return h("section", { class: "sim-toolbar" }, [
+      h("div", { class: "sim-toolbar-text" }, [
+        h("h2", {}, "Simuler VM"),
+        h("p", {}, status),
+      ]),
+      h("div", { class: "sim-toolbar-actions" }, actions),
+    ]);
+  }
+
+  function renderGroup(g) {
+    const teams = orderedGroup(g);
+    const ranked = isGroupRanked(g);
+
+    const list = h(
+      "div",
+      {
+        class: "team-grid rank-list",
+        "data-group": g,
+      },
+      teams.map((t, idx) => renderRankCard(t, idx, g))
+    );
+
+    attachDragHandlers(list, g);
+
+    const children = [
+      h("div", { class: "group-header" }, [
+        h("h2", { class: "group-title", "data-letter": g }, `Gruppe ${g}`),
+        h("span", { class: "group-hint" }, ranked ? "Rangert" : "Dra for å rangere"),
+      ]),
+      list,
+    ];
+
+    if (ranked) {
+      children.push(renderThirdStats(g, teams[2]));
+    }
+
+    return h("section", { class: "group" }, children);
+  }
+
+  function renderRankCard(team, idx, g) {
     const last5 = team.form.slice(-5);
     const sum = summarize(last5);
 
     const formStrip = h(
       "div",
       { class: "form-strip" },
-      last5.map((m) => h("span", { class: resultPillClass(m.result), title: `${m.opponent} ${m.score}` }, resultLetter(m.result)))
+      last5.map((m) =>
+        h("span", { class: resultPillClass(m.result), title: `${m.opponent} ${m.score}` }, resultLetter(m.result))
+      )
     );
 
-    return h(
-      "a",
-      { class: "team-card", href: `#/team/${team.code}` },
+    const card = h(
+      "div",
+      {
+        class: "team-card rank-card",
+        "data-code": team.code,
+        "data-group": g,
+        draggable: "true",
+        tabindex: "0",
+        role: "listitem",
+        "aria-label": `Plass ${idx + 1}: ${team.name}`,
+      },
       [
-        h("div", { class: "team-card-top" }, [
-          h("span", { class: "team-flag" }, team.flag),
-          h("div", {}, [
-            h("div", { class: "team-name" }, team.name),
-            h("div", { class: "team-meta" }, `Trener: ${team.coach}`),
+        h("span", { class: `rank-badge rank-${idx + 1}` }, String(idx + 1)),
+        h("button", {
+          class: "rank-handle",
+          type: "button",
+          "aria-label": "Dra for å endre plassering",
+          title: "Dra",
+          html: "⋮⋮",
+        }),
+        h("div", { class: "rank-card-main" }, [
+          h("div", { class: "team-card-top" }, [
+            h("span", { class: "team-flag" }, team.flag),
+            h("div", {}, [
+              h("div", { class: "team-name" }, team.name),
+              h("div", { class: "team-meta" }, `Trener: ${team.coach}`),
+            ]),
+          ]),
+          h("div", { class: "team-card-bottom" }, [
+            formStrip,
+            h("span", {
+              class: "gd",
+              title: `${sum.w} seire, ${sum.d} uavgjort, ${sum.l} tap`,
+              html: `<strong>${sum.gf}</strong>–<strong>${sum.ga}</strong>`,
+            }),
           ]),
         ]),
-        h("div", { class: "team-card-bottom" }, [
-          formStrip,
-          h("span", {
-            class: "gd",
-            title: `${sum.w} seire, ${sum.d} uavgjort, ${sum.l} tap`,
-            html: `<strong>${sum.gf}</strong>–<strong>${sum.ga}</strong>`,
-          }),
-        ]),
+        h(
+          "a",
+          {
+            class: "rank-detail-link",
+            href: `#/team/${team.code}`,
+            "aria-label": `Detaljer for ${team.name}`,
+            title: "Åpne lagprofil",
+          },
+          "→"
+        ),
       ]
     );
+
+    card.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+      e.preventDefault();
+      const teams = orderedGroup(g).map((t) => t.code);
+      const i = teams.indexOf(team.code);
+      const j = e.key === "ArrowUp" ? i - 1 : i + 1;
+      if (j < 0 || j >= teams.length) return;
+      [teams[i], teams[j]] = [teams[j], teams[i]];
+      simState.groupOrder[g] = teams;
+      pruneInvalidWinners();
+      persist();
+      route();
+      const next = document.querySelector(`.rank-card[data-group="${g}"][data-code="${team.code}"]`);
+      if (next) next.focus();
+    });
+
+    return card;
+  }
+
+  function attachDragHandlers(listEl, g) {
+    let draggedCode = null;
+
+    listEl.addEventListener("dragstart", (e) => {
+      const card = e.target.closest(".rank-card");
+      if (!card || card.dataset.group !== g) return;
+      draggedCode = card.dataset.code;
+      card.classList.add("is-dragging");
+      e.dataTransfer.effectAllowed = "move";
+      try { e.dataTransfer.setData("text/plain", draggedCode); } catch (_) {}
+    });
+
+    listEl.addEventListener("dragend", () => {
+      const el = listEl.querySelector(".is-dragging");
+      if (el) el.classList.remove("is-dragging");
+      listEl.querySelectorAll(".drop-target").forEach((n) => n.classList.remove("drop-target"));
+      draggedCode = null;
+    });
+
+    listEl.addEventListener("dragover", (e) => {
+      const card = e.target.closest(".rank-card");
+      if (!card || card.dataset.group !== g) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      listEl.querySelectorAll(".drop-target").forEach((n) => n.classList.remove("drop-target"));
+      card.classList.add("drop-target");
+    });
+
+    listEl.addEventListener("drop", (e) => {
+      const card = e.target.closest(".rank-card");
+      if (!card || card.dataset.group !== g) return;
+      e.preventDefault();
+      const targetCode = card.dataset.code;
+      if (!draggedCode || draggedCode === targetCode) return;
+      const order = orderedGroup(g).map((t) => t.code);
+      const from = order.indexOf(draggedCode);
+      const to = order.indexOf(targetCode);
+      if (from < 0 || to < 0) return;
+      order.splice(from, 1);
+      order.splice(to, 0, draggedCode);
+      simState.groupOrder[g] = order;
+      pruneInvalidWinners();
+      persist();
+      route();
+    });
+  }
+
+  function renderThirdStats(g, team) {
+    const stats = simState.thirdStats[g] || {};
+    const update = (field) => (e) => {
+      const v = e.target.value === "" ? null : parseInt(e.target.value, 10);
+      const cur = simState.thirdStats[g] || {};
+      const next = { ...cur, [field]: Number.isFinite(v) ? v : undefined };
+      simState.thirdStats[g] = next;
+      persist();
+      const banner = document.querySelector(".sim-toolbar");
+      if (banner) banner.replaceWith(renderSimToolbar());
+    };
+
+    const input = (label, field, min, max) =>
+      h("label", { class: "third-stat-field" }, [
+        h("span", {}, label),
+        h("input", {
+          type: "number",
+          inputmode: "numeric",
+          min: min != null ? String(min) : null,
+          max: max != null ? String(max) : null,
+          step: "1",
+          value: stats[field] != null ? String(stats[field]) : "",
+          onchange: update(field),
+          oninput: update(field),
+        }),
+      ]);
+
+    return h("div", { class: "third-stats" }, [
+      h("div", { class: "third-stats-head" }, [
+        h("span", { class: "team-flag", style: "font-size:18px" }, team.flag),
+        h("strong", {}, team.name),
+        h("span", { class: "third-stats-hint" }, "Tredjeplass — fyll inn for cutline:"),
+      ]),
+      h("div", { class: "third-stats-fields" }, [
+        input("Poeng", "pts", 0, 9),
+        input("Målforskjell", "gd", -20, 20),
+        input("Mål for", "gf", 0, 30),
+      ]),
+    ]);
+  }
+
+  // ---------- bracket view ----------
+
+  function renderBracket() {
+    const fixtures = window.BRACKET_FIXTURES || [];
+    const rounds = window.BRACKET_ROUNDS || [];
+
+    const root = h("div", { class: "bracket-page" });
+
+    root.appendChild(
+      h("div", { class: "bracket-header" }, [
+        h("a", { class: "back-link", href: "#/" }, "← Tilbake til gruppene"),
+        h("button", {
+          class: "btn btn-ghost",
+          type: "button",
+          onclick: () => {
+            if (confirm("Nullstille alle vinnervalg i bracketen?")) {
+              simState.matchWinners = {};
+              persist();
+              route();
+            }
+          },
+        }, "Nullstill bracket"),
+      ])
+    );
+
+    const champion = simState.matchWinners[104]
+      ? teamByCode[simState.matchWinners[104]]
+      : null;
+    if (champion) {
+      root.appendChild(
+        h("section", { class: "champion-banner" }, [
+          h("span", { class: "champion-trophy" }, "🏆"),
+          h("div", {}, [
+            h("div", { class: "champion-label" }, "Verdensmester 2026"),
+            h("div", { class: "champion-name" }, [
+              h("span", { class: "team-flag", style: "font-size:34px" }, champion.flag),
+              h("span", {}, champion.name),
+            ]),
+          ]),
+        ])
+      );
+    }
+
+    const alloc = thirdAllocation();
+    if (allGroupsRanked() && allThirdStatsComplete() && (!alloc || !alloc.mapping)) {
+      root.appendChild(
+        h("p", { class: "bracket-warning" }, "Klarte ikke å slå opp tredjeplass-kombinasjonen.")
+      );
+    }
+
+    const grid = h("div", { class: "bracket-grid" });
+    for (const r of rounds) {
+      const matches = fixtures.filter((f) => f.round === r.id);
+      const col = h("div", { class: `bracket-col bracket-col-${r.id}` }, [
+        h("h3", { class: "bracket-col-title" }, r.title),
+        ...matches.map(renderBracketMatch),
+      ]);
+      grid.appendChild(col);
+    }
+    root.appendChild(grid);
+
+    return root;
+  }
+
+  function renderBracketMatch(fx) {
+    const home = resolveRef(fx.home);
+    const away = resolveRef(fx.away);
+    const winnerCode = simState.matchWinners[fx.id];
+
+    const teamRow = (team, ref, side) => {
+      const placeholder = !team ? refPlaceholder(ref) : null;
+      const isWinner = team && winnerCode === team.code;
+      const isLoser = team && winnerCode && winnerCode !== team.code;
+      const cls = [
+        "bracket-team",
+        team ? "is-resolved" : "is-pending",
+        isWinner ? "is-winner" : "",
+        isLoser ? "is-eliminated" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      return h(
+        "button",
+        {
+          class: cls,
+          type: "button",
+          disabled: team ? null : "disabled",
+          "data-side": side,
+          onclick: () => team && pickWinner(fx.id, team.code),
+        },
+        [
+          h("span", { class: "team-flag", style: "font-size:18px" }, team ? team.flag : "·"),
+          h("span", { class: "bracket-team-name" }, team ? team.name : placeholder),
+          isWinner ? h("span", { class: "bracket-tick" }, "✓") : null,
+        ]
+      );
+    };
+
+    return h("article", { class: `bracket-match round-${fx.round}` }, [
+      h("header", { class: "bracket-match-meta" }, [
+        h("span", { class: "bracket-match-id" }, `#${fx.id}`),
+        h("span", { class: "bracket-match-date" }, formatDate(fx.date)),
+        h("span", { class: "bracket-match-venue", title: fx.venue }, fx.venue.split(",")[0]),
+      ]),
+      teamRow(home, fx.home, "home"),
+      teamRow(away, fx.away, "away"),
+    ]);
+  }
+
+  function pickWinner(matchId, code) {
+    if (simState.matchWinners[matchId] === code) {
+      delete simState.matchWinners[matchId];
+    } else {
+      simState.matchWinners[matchId] = code;
+    }
+    pruneInvalidWinners();
+    persist();
+    route();
   }
 
   function renderTeamDetail(code) {
@@ -370,6 +871,8 @@
     const teamMatch = hash.match(/^#\/team\/([A-Z]{2,4})$/i);
     if (teamMatch) {
       app.appendChild(renderTeamDetail(teamMatch[1].toUpperCase()));
+    } else if (hash === "#/bracket") {
+      app.appendChild(renderBracket());
     } else {
       app.appendChild(renderOverview());
     }
