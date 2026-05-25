@@ -17,6 +17,10 @@
   const sub = document.getElementById("tournament-sub");
   sub.textContent = `${DATA.tournament.name} · ${DATA.tournament.host}`;
 
+  let lastHash = location.hash || "#/";
+  let scrollRestore = null;
+  const TEAM_RETURN_KEY = "vm-team-return-to";
+
   const POS_LABELS = {
     GK: "Keeper",
     DEF: "Forsvar",
@@ -712,10 +716,65 @@
 
   // ---------- bracket view ----------
 
-  function renderBracket() {
-    const fixtures = window.BRACKET_FIXTURES || [];
-    const rounds = window.BRACKET_ROUNDS || [];
+  function bracketFixture(id) {
+    return (window.BRACKET_FIXTURES || []).find((f) => f.id === id);
+  }
 
+  function renderBracketSubtree(node, reverse) {
+    const feeders = node.children.map((child) =>
+      typeof child === "number"
+        ? h("div", { class: "bracket-match-wrap" }, renderBracketMatch(bracketFixture(child)))
+        : renderBracketSubtree(child, reverse)
+    );
+    const pairCls = reverse ? "bracket-pair bracket-pair-reverse" : "bracket-pair";
+    return h("div", { class: pairCls }, [
+      h("div", { class: "bracket-feeders" }, feeders),
+      h("div", { class: "bracket-join", "aria-hidden": "true" }),
+      h("div", { class: "bracket-match-wrap" }, renderBracketMatch(bracketFixture(node.match))),
+    ]);
+  }
+
+  function renderBracketForest(children, reverse) {
+    const feeders = children.map((child) => renderBracketSubtree(child, reverse));
+    const pairCls = reverse
+      ? "bracket-pair bracket-pair-open bracket-pair-reverse"
+      : "bracket-pair bracket-pair-open";
+    return h("div", { class: pairCls }, [
+      h("div", { class: "bracket-feeders" }, feeders),
+      h("div", { class: "bracket-join bracket-join-out", "aria-hidden": "true" }),
+    ]);
+  }
+
+  function renderBracketHalf(label, tree, reverse) {
+    const sfWrap = h(
+      "div",
+      { class: "bracket-sf-out" },
+      renderBracketMatch(bracketFixture(tree.sf))
+    );
+    const forest = renderBracketForest(tree.children, reverse);
+    const inner = reverse
+      ? h("div", { class: "bracket-half-inner" }, [sfWrap, forest])
+      : h("div", { class: "bracket-half-inner" }, [forest, sfWrap]);
+
+    return h("section", { class: reverse ? "bracket-half bracket-half-right" : "bracket-half bracket-half-left" }, [
+      h("h3", { class: "bracket-half-label" }, label),
+      inner,
+    ]);
+  }
+
+  function renderBracketCenter(matchIds) {
+    return h("section", { class: "bracket-center" }, [
+      h("h3", { class: "bracket-half-label bracket-center-label" }, "Finale"),
+      h("div", { class: "bracket-center-matches" }, matchIds.map((id) => {
+        const fx = bracketFixture(id);
+        const extra =
+          id === 104 ? " bracket-center-final" : id === 103 ? " bracket-center-bronze" : "";
+        return h("div", { class: `bracket-match-wrap${extra}` }, renderBracketMatch(fx));
+      })),
+    ]);
+  }
+
+  function renderBracket() {
     const root = h("div", { class: "bracket-page" });
 
     root.appendChild(
@@ -760,16 +819,19 @@
       );
     }
 
-    const grid = h("div", { class: "bracket-grid" });
-    for (const r of rounds) {
-      const matches = fixtures.filter((f) => f.round === r.id);
-      const col = h("div", { class: `bracket-col bracket-col-${r.id}` }, [
-        h("h3", { class: "bracket-col-title" }, r.title),
-        ...matches.map(renderBracketMatch),
-      ]);
-      grid.appendChild(col);
-    }
-    root.appendChild(grid);
+    const board = h("div", { class: "bracket-board" }, [
+      h(
+        "p",
+        { class: "bracket-hint" },
+        "Klikk på et lag for å velge vinner. Klikk igjen for å angre. Pil → åpner lagprofil."
+      ),
+      h("div", { class: "bracket-scroll" }, [
+        renderBracketHalf("Venstre bracket", window.BRACKET_TREE_LEFT, false),
+        renderBracketCenter(window.BRACKET_CENTER || [104, 103]),
+        renderBracketHalf("Høyre bracket", window.BRACKET_TREE_RIGHT, true),
+      ]),
+    ]);
+    root.appendChild(board);
 
     return root;
   }
@@ -792,7 +854,7 @@
         .filter(Boolean)
         .join(" ");
 
-      return h(
+      const pickBtn = h(
         "button",
         {
           class: cls,
@@ -807,6 +869,21 @@
           isWinner ? h("span", { class: "bracket-tick" }, "✓") : null,
         ]
       );
+
+      const detailLink = team
+        ? h(
+            "a",
+            {
+              class: "bracket-detail-link",
+              href: `#/team/${team.code}`,
+              "aria-label": `Detaljer for ${team.name}`,
+              title: "Åpne lagprofil",
+            },
+            "→"
+          )
+        : null;
+
+      return h("div", { class: "bracket-team-row" }, [pickBtn, detailLink]);
     };
 
     return h("article", {
@@ -862,7 +939,7 @@
         ]),
       ]);
       if (oldBanner) oldBanner.replaceWith(banner);
-      else page.insertBefore(banner, page.querySelector(".bracket-grid"));
+      else page.insertBefore(banner, page.querySelector(".bracket-board"));
     } else if (oldBanner) {
       oldBanner.remove();
     }
@@ -878,7 +955,7 @@
         "Klarte ikke å slå opp tredjeplass-kombinasjonen."
       );
       if (oldWarn) oldWarn.replaceWith(warn);
-      else page.insertBefore(warn, page.querySelector(".bracket-grid"));
+      else page.insertBefore(warn, page.querySelector(".bracket-board"));
     } else if (oldWarn) {
       oldWarn.remove();
     }
@@ -890,17 +967,26 @@
     }
   }
 
+  function teamDetailReturnTo() {
+    const stored = sessionStorage.getItem(TEAM_RETURN_KEY);
+    return stored === "#/bracket" ? "#/bracket" : "#/";
+  }
+
   function renderTeamDetail(code) {
     const team = DATA.teams.find((t) => t.code === code);
+    const returnTo = teamDetailReturnTo();
+    const backLabel =
+      returnTo === "#/bracket" ? "← Tilbake til bracket" : "← Tilbake til oversikt";
+
     if (!team) {
       return h("div", {}, [
-        h("a", { class: "back-link", href: "#/" }, "← Tilbake til oversikt"),
+        h("a", { class: "back-link", href: returnTo }, backLabel),
         h("p", {}, `Fant ikke lag «${code}».`),
       ]);
     }
 
     return h("div", { class: "team-detail" }, [
-      h("a", { class: "back-link", href: "#/" }, "← Tilbake til oversikt"),
+      h("a", { class: "back-link", href: returnTo }, backLabel),
       h("header", { class: "team-header" }, [
         h("span", { class: "team-flag" }, team.flag),
         h("div", {}, [
@@ -999,21 +1085,70 @@
 
   // ---------- router ----------
 
+  function capturePageScroll(pageHash) {
+    const scroller =
+      pageHash === "#/bracket" ? document.querySelector(".bracket-scroll") : null;
+    return {
+      y: window.scrollY,
+      x: scroller ? scroller.scrollLeft : 0,
+    };
+  }
+
+  function restorePageScroll(pageHash, pos) {
+    requestAnimationFrame(() => {
+      window.scrollTo(0, pos.y);
+      if (pageHash === "#/bracket") {
+        const scroller = document.querySelector(".bracket-scroll");
+        if (scroller) scroller.scrollLeft = pos.x;
+      }
+    });
+  }
+
+  function onHashChange() {
+    const prev = lastHash;
+    const hash = location.hash || "#/";
+    const teamRe = /^#\/team\/([A-Z]{2,4})$/i;
+
+    if ((prev === "#/bracket" || prev === "#/") && teamRe.test(hash)) {
+      scrollRestore = { hash: prev, pos: capturePageScroll(prev) };
+      sessionStorage.setItem(TEAM_RETURN_KEY, prev);
+    } else if (teamRe.test(prev) && hash !== prev && hash !== "#/bracket" && hash !== "#/") {
+      scrollRestore = null;
+    } else if (hash === "#/" || hash === "#/bracket") {
+      sessionStorage.removeItem(TEAM_RETURN_KEY);
+    }
+
+    lastHash = hash;
+    route();
+  }
+
   function route() {
     const hash = location.hash || "#/";
+    const restore = scrollRestore && scrollRestore.hash === hash;
     app.innerHTML = "";
-    window.scrollTo(0, 0);
+    app.classList.toggle("is-bracket", hash === "#/bracket");
+    if (!restore) window.scrollTo(0, 0);
 
     const teamMatch = hash.match(/^#\/team\/([A-Z]{2,4})$/i);
     if (teamMatch) {
       app.appendChild(renderTeamDetail(teamMatch[1].toUpperCase()));
     } else if (hash === "#/bracket") {
       app.appendChild(renderBracket());
+      if (restore) {
+        const { pos } = scrollRestore;
+        scrollRestore = null;
+        restorePageScroll("#/bracket", pos);
+      }
     } else {
       app.appendChild(renderOverview());
+      if (restore) {
+        const { pos } = scrollRestore;
+        scrollRestore = null;
+        restorePageScroll("#/", pos);
+      }
     }
   }
 
-  window.addEventListener("hashchange", route);
+  window.addEventListener("hashchange", onHashChange);
   route();
 })();

@@ -93,4 +93,48 @@
     { id: "3PO", title: "Bronsefinale" },
     { id: "F", title: "Finale" },
   ];
+
+  // Nested knockout trees: children are match ids (R32) or { match, children }.
+  // sf = semifinal on this side; center holds only the final + bronze matches.
+  window.BRACKET_TREE_LEFT = {
+    sf: 101,
+    children: [
+      {
+        match: 97,
+        children: [
+          { match: 90, children: [73, 75] },
+          { match: 89, children: [74, 77] },
+        ],
+      },
+      {
+        match: 98,
+        children: [
+          { match: 93, children: [83, 84] },
+          { match: 94, children: [81, 82] },
+        ],
+      },
+    ],
+  };
+
+  window.BRACKET_TREE_RIGHT = {
+    sf: 102,
+    children: [
+      {
+        match: 99,
+        children: [
+          { match: 91, children: [76, 78] },
+          { match: 92, children: [79, 80] },
+        ],
+      },
+      {
+        match: 100,
+        children: [
+          { match: 95, children: [86, 88] },
+          { match: 96, children: [85, 87] },
+        ],
+      },
+    ],
+  };
+
+  window.BRACKET_CENTER = [104, 103];
 })();
